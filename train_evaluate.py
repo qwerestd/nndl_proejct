@@ -1,112 +1,43 @@
+import argparse
+import csv
 import os
-import time
-import torch
-import torch.nn as nn
-from torch import optim
-from sklearn.metrics import classification_report, confusion_matrix, accuracy_score
-import seaborn as sns
+
 import matplotlib.pyplot as plt
+import seaborn as sns
+import torch
+import torch.nn.functional as F
+from sklearn.metrics import classification_report, confusion_matrix, accuracy_score, f1_score
 
 from dataset import prepare_dataloaders
+from engine import TrainConfig, set_seed, train_single_model, collect_logits, benchmark_model
+from ensemble import (fit_temperature, expected_calibration_error, ensemble_probs, search_ensemble,
+                      save_ensemble_config)
 from models import HybridTrashNet, RWCNet, ModernHybridNet, MobileDeployWrapper
 
 
-def train_single_model(model, model_name, train_loader, valid_loader, class_weights, save_path, epochs=25,
-                       device='cuda', freeze_early=False):
-    print(f"\n{'=' * 60}\nStart Training [{model_name}] on {device}\n{'=' * 60}")
-    model = model.to(device)
-    criterion = nn.NLLLoss(weight=class_weights.to(device))
-
-    # 可选加速策略：针对 RWC-Net 等重型网络冻结浅层 stage1 参数
-    if freeze_early:
-        for name, param in model.named_parameters():
-            if "dense_stage1" in name or "mobile_stage1" in name:
-                param.requires_grad = False
-
-    # 区分预训练主干与新增分类头，采用差分学习率 (新增 swin_norm 适配 ModernHybridNet)
-    backbone_keys = ('branch1_features', 'branch2_features', 'swin_norm', 'dense_stage', 'mobile_stage')
-    backbone_params = [p for n, p in model.named_parameters() if n.startswith(backbone_keys) and p.requires_grad]
-    head_params = [p for n, p in model.named_parameters() if not n.startswith(backbone_keys) and p.requires_grad]
-
-    optimizer = optim.AdamW([
-        {'params': backbone_params, 'lr': 1e-4},
-        {'params': head_params, 'lr': 1e-3}
-    ], weight_decay=1e-4)
-
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
-
-    # 开启 AMP 混合精度训练加速 (大幅缩短 RWC-Net 与 Swin-T 训练耗时)
-    use_amp = (device.type == 'cuda')
-    scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
-
-    best_acc, patience, patience_limit = 0.0, 0, 8
-
-    for epoch in range(epochs):
-        t0 = time.time()
-        model.train()
-        train_loss, train_correct = 0.0, 0
-
-        for inputs, labels in train_loader:
-            inputs, labels = inputs.to(device), labels.to(device)
-            optimizer.zero_grad()
-
-            with torch.amp.autocast('cuda', enabled=use_amp):
-                # 主损失 + 指数衰减辅助分支损失 (修复原代码漏掉的 * 乘号)
-                out_main, out_aux2, out_aux1 = model(inputs)
-                loss = criterion(out_main, labels) + 0.5 * criterion(out_aux2, labels) + 0.25 * criterion(out_aux1,
-                                                                                                          labels)
-
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-
-            train_loss += loss.item() * inputs.size(0)
-            train_correct += (out_main.argmax(1) == labels).sum().item()
-
-        scheduler.step()
-
-        # 验证集评估
-        model.eval()
-        valid_loss, valid_correct = 0.0, 0
-        with torch.no_grad():
-            for inputs, labels in valid_loader:
-                inputs, labels = inputs.to(device), labels.to(device)
-                with torch.amp.autocast('cuda', enabled=use_amp):
-                    outputs = model(inputs)
-                    v_loss = criterion(outputs, labels)
-                valid_loss += v_loss.item() * inputs.size(0)
-                valid_correct += (outputs.argmax(1) == labels).sum().item()
-
-        t_acc = train_correct / len(train_loader.dataset) * 100
-        v_acc = valid_correct / len(valid_loader.dataset) * 100
-        print(f"Epoch [{epoch + 1:02d}/{epochs:02d}] ({time.time() - t0:.1f}s) | "
-              f"Train Loss: {train_loss / len(train_loader.dataset):.4f}, Acc: {t_acc:.2f}% | "
-              f"Valid Loss: {valid_loss / len(valid_loader.dataset):.4f}, Acc: {v_acc:.2f}%")
-
-        if v_acc > best_acc:
-            best_acc = v_acc
-            torch.save(model.state_dict(), save_path)
-            print(f"  --> Best [{model_name}] saved (Valid Acc: {best_acc:.2f}%)")
-            patience = 0
-        else:
-            patience += 1
-            if patience >= patience_limit:
-                print(f"Early stopping triggered at epoch {epoch + 1}.")
-                break
+def get_model_specs(args):
+    modern_suffix = '' if args.modern_fusion == 'concat' else f'_{args.modern_fusion}'
+    return {
+        # 1. SOTA Baseline 1: Hybrid-ResSeMo (论文 1)
+        'hybrid': dict(label='Hybrid-ResSeMo', short='ResSeMo', build=lambda n: HybridTrashNet(num_classes=n),
+                       ckpt='hybrid_ressemo_best.pt', cm='cm_hybrid.png', cmap='Blues',
+                       cfg=dict(epochs=args.epochs or 30)),
+        # 2. SOTA Baseline 2: RWC-Net (论文 2, 开启浅层冻结加速)
+        'rwc': dict(label='RWC-Net', short='RWC-Net', build=lambda n: RWCNet(num_classes=n),
+                    ckpt='rwcnet_best.pt', cm='cm_rwcnet.png', cmap='Greens',
+                    cfg=dict(epochs=args.epochs or 20, freeze_early=True)),
+        # 3. Proposed Novel SOTA: ModernHybridNet (ConvNeXt + Swin-T + GRN)
+        'modern': dict(label='Modern-ConvNeXt-Swin', short='ModernHybrid',
+                       build=lambda n: ModernHybridNet(num_classes=n, fusion=args.modern_fusion),
+                       ckpt=f'modern_convnext_swin{modern_suffix}_best.pt', cm='cm_modern.png', cmap='Oranges',
+                       cfg=dict(epochs=args.epochs or 30)),
+    }
 
 
-def get_tta_probabilities(model, test_loader, device):
-    """使用测试时增强 (TTA: 原图 + 水平翻转) 获取预测概率分布"""
-    model.eval()
-    all_probs, all_labels = [], []
-    with torch.no_grad():
-        for inputs, labels in test_loader:
-            inputs = inputs.to(device)
-            p1 = torch.exp(model(inputs))
-            p2 = torch.exp(model(torch.flip(inputs, dims=[3])))
-            all_probs.append(((p1 + p2) / 2.0).cpu())
-            all_labels.extend(labels.numpy())
-    return torch.cat(all_probs, dim=0), all_labels
+def make_train_config(args, overrides):
+    return TrainConfig(warmup_epochs=args.warmup_epochs, weight_decay=args.weight_decay,
+                       label_smoothing=args.label_smoothing, loss=args.loss, mix_prob=args.mix_prob,
+                       use_ema=not args.no_ema, **overrides)
 
 
 def save_confusion_matrix(labels, preds, class_names, title, save_path, cmap='Blues'):
@@ -121,95 +52,171 @@ def save_confusion_matrix(labels, preds, class_names, title, save_path, cmap='Bl
     plt.close()
 
 
+def plot_efficiency(rows, save_path):
+    """精度-计算量权衡图 (气泡大小 = 参数量)"""
+    plt.figure(figsize=(7, 5))
+    for r in rows:
+        plt.scatter(r['gflops'], r['test_acc'], s=max(r['params_m'], 1) * 6, alpha=0.6)
+        plt.annotate(f"{r['name']}\n{r['params_m']:.1f}M", (r['gflops'], r['test_acc']),
+                     textcoords='offset points', xytext=(6, 6), fontsize=9)
+    plt.xlabel('GFLOPs (224x224, batch=1)')
+    plt.ylabel('Test Accuracy (%)')
+    plt.title('Accuracy vs. Compute (bubble size = #Params)')
+    plt.grid(alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300)
+    plt.close()
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description='TrashNet training / calibrated ensemble / efficiency benchmark')
+    p.add_argument('--img-size', type=int, default=224, help='输入分辨率, 可尝试 288 / 320')
+    p.add_argument('--batch-size', type=int, default=32)
+    p.add_argument('--num-workers', type=int, default=4)
+    p.add_argument('--epochs', type=int, default=None, help='覆盖所有模型的训练轮数')
+    p.add_argument('--warmup-epochs', type=int, default=3)
+    p.add_argument('--weight-decay', type=float, default=0.05)
+    p.add_argument('--label-smoothing', type=float, default=0.1)
+    p.add_argument('--loss', choices=['ce', 'focal'], default='ce')
+    p.add_argument('--mix-prob', type=float, default=0.5, help='Mixup/CutMix 触发概率, 0 关闭')
+    p.add_argument('--no-ema', action='store_true')
+    p.add_argument('--modern-fusion', choices=['concat', 'gated', 'cross_attn'], default='concat')
+    p.add_argument('--retrain', default='', help="重新训练的模型: 'all' 或逗号分隔 hybrid,rwc,modern")
+    p.add_argument('--no-tta', action='store_true')
+    p.add_argument('--skip-benchmark', action='store_true')
+    p.add_argument('--skip-export', action='store_true')
+    p.add_argument('--seed', type=int, default=42)
+    return p.parse_args()
+
+
 if __name__ == '__main__':
+    args = parse_args()
+    set_seed(args.seed)
     base_dir = os.path.dirname(os.path.abspath(__file__))
     data_dir = os.path.join(base_dir, 'data', 'dataset-resized')
     out_dir = os.path.join(base_dir, 'outputs')
     os.makedirs(out_dir, exist_ok=True)
 
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    train_loader, valid_loader, test_loader, class_weights, class_names, _ = prepare_dataloaders(data_dir,
-                                                                                                 batch_size=32)
+    train_loader, valid_loader, test_loader, class_weights, class_names, _ = prepare_dataloaders(
+        data_dir, batch_size=args.batch_size, img_size=args.img_size, num_workers=args.num_workers)
+    num_classes = len(class_names)
 
-    hybrid_ckpt = os.path.join(out_dir, 'hybrid_ressemo_best.pt')
-    rwc_ckpt = os.path.join(out_dir, 'rwcnet_best.pt')
-    modern_ckpt = os.path.join(out_dir, 'modern_convnext_swin_best.pt')
-
-    # ==========================================================
-    # 1. 训练或加载 SOTA Baseline 1: Hybrid-ResSeMo (论文 1)
-    # ==========================================================
-    model_hybrid = HybridTrashNet(num_classes=len(class_names)).to(device)
-    if not os.path.exists(hybrid_ckpt):
-        train_single_model(model_hybrid, "Hybrid-ResSeMo", train_loader, valid_loader, class_weights, hybrid_ckpt,
-                           epochs=25, device=device)
-    model_hybrid.load_state_dict(torch.load(hybrid_ckpt, map_location=device, weights_only=True))
+    specs = get_model_specs(args)
+    retrain = set(specs) if args.retrain == 'all' else {s.strip() for s in args.retrain.split(',') if s.strip()}
 
     # ==========================================================
-    # 2. 训练或加载 SOTA Baseline 2: RWC-Net (论文 2, 开启浅层冻结加速)
+    # 1-3. 训练或加载三个模型
     # ==========================================================
-    model_rwc = RWCNet(num_classes=len(class_names)).to(device)
-    if not os.path.exists(rwc_ckpt):
-        train_single_model(model_rwc, "RWC-Net", train_loader, valid_loader, class_weights, rwc_ckpt, epochs=15,
-                           device=device, freeze_early=True)
-    model_rwc.load_state_dict(torch.load(rwc_ckpt, map_location=device, weights_only=True))
-
-    # ==========================================================
-    # 3. 训练或加载 Proposed Novel SOTA: ModernHybridNet (ConvNeXt + Swin-T + GRN)
-    # ==========================================================
-    model_modern = ModernHybridNet(num_classes=len(class_names)).to(device)
-    if not os.path.exists(modern_ckpt):
-        train_single_model(model_modern, "Modern-ConvNeXt-Swin", train_loader, valid_loader, class_weights, modern_ckpt,
-                           epochs=20, device=device)
-    model_modern.load_state_dict(torch.load(modern_ckpt, map_location=device, weights_only=True))
+    loaded = {}
+    for key, spec in specs.items():
+        ckpt = os.path.join(out_dir, spec['ckpt'])
+        model = spec['build'](num_classes).to(device)
+        if key in retrain or not os.path.exists(ckpt):
+            cfg = make_train_config(args, spec['cfg'])
+            train_single_model(model, spec['label'], train_loader, valid_loader, class_weights, ckpt, cfg, device)
+        else:
+            print(f"[{spec['label']}] 加载已有 checkpoint: {ckpt} (如需使用新训练策略请加 --retrain {key})")
+        model.load_state_dict(torch.load(ckpt, map_location=device, weights_only=True))
+        loaded[key] = model.eval()
 
     # ==========================================================
-    # 4. 独立测试集评估与 Confidence-Calibrated Ensemble (解决 Cardboard/Plastic 漏检)
+    # 4. 验证集拟合: 温度校准 + 集成超参数 (测试集完全不参与调参)
     # ==========================================================
-    probs_hybrid, labels = get_tta_probabilities(model_hybrid, test_loader, device)
-    probs_rwc, _ = get_tta_probabilities(model_rwc, test_loader, device)
-    probs_modern, _ = get_tta_probabilities(model_modern, test_loader, device)
+    tta = not args.no_tta
+    val_logits, test_logits, temps = {}, {}, {}
+    for key, model in loaded.items():
+        val_logits[key], val_labels = collect_logits(model, valid_loader, device, tta=tta)
+        test_logits[key], test_labels = collect_logits(model, test_loader, device, tta=tta)
+        temps[key] = fit_temperature(val_logits[key], val_labels)
 
-    # 融合策略: 结合最大置信度融合与软投票，并对易漏检的 cardboard(0) 和 plastic(4) 施加置信度补偿
-    probs_max = torch.max(torch.max(probs_hybrid, probs_rwc), probs_modern)
-    probs_avg = (probs_hybrid + probs_rwc + probs_modern) / 3.0
-    probs_ensemble = 0.5 * probs_max + 0.5 * probs_avg
+    keys = list(loaded)
+    val_probs = [F.softmax(val_logits[k] / temps[k], dim=1) for k in keys]
+    test_probs = {k: F.softmax(test_logits[k] / temps[k], dim=1) for k in keys}
 
-    # 针对性修正混淆矩阵痛点 (0: cardboard, 4: plastic)
-    probs_ensemble[:, 0] *= 1.06
-    probs_ensemble[:, 4] *= 1.06
-    probs_ensemble = probs_ensemble / probs_ensemble.sum(dim=1, keepdim=True)
+    ens_cfg = search_ensemble(val_probs, val_labels)
+    ens_cfg.update({'models': keys, 'temperatures': [temps[k] for k in keys], 'img_size': args.img_size,
+                    'tta': tta, 'checkpoints': [specs[k]['ckpt'] for k in keys]})
+    save_ensemble_config(os.path.join(out_dir, 'ensemble_config.json'), ens_cfg)
+    print("\n[Ensemble] 验证集拟合结果: "
+          f"weights={[round(w, 2) for w in ens_cfg['weights']]}, alpha={ens_cfg['alpha']}, "
+          f"class_bias={dict(zip(class_names, ens_cfg['class_bias']))}, val macro-F1={ens_cfg['val_macro_f1']:.4f}")
 
-    preds_hybrid = probs_hybrid.argmax(dim=1).numpy()
-    preds_rwc = probs_rwc.argmax(dim=1).numpy()
-    preds_modern = probs_modern.argmax(dim=1).numpy()
-    preds_ensemble = probs_ensemble.argmax(dim=1).numpy()
+    probs_ensemble = ensemble_probs([test_probs[k] for k in keys], ens_cfg['weights'], ens_cfg['alpha'],
+                                    ens_cfg['class_bias'])
 
-    # 打印并保存全套对比实验图表 (直接用于 Project Report)
-    eval_configs = [
-        ("1. [Baseline 1: Hybrid-ResSeMo]", preds_hybrid, "Hybrid-ResSeMo Confusion Matrix", "cm_hybrid.png", "Blues"),
-        ("2. [Baseline 2: RWC-Net]", preds_rwc, "RWC-Net Confusion Matrix", "cm_rwcnet.png", "Greens"),
-        ("3. [Proposed SOTA: Modern-ConvNeXt-Swin]", preds_modern, "Modern-Hybrid Confusion Matrix", "cm_modern.png",
-         "Oranges"),
-        ("4. [Proposed Calibrated Ensemble]", preds_ensemble, "Calibrated Ensemble Confusion Matrix", "cm_ensemble.png",
-         "Purples")
-    ]
+    # ==========================================================
+    # 5. 独立测试集评估 (只运行一次, 直接用于 Project Report)
+    # ==========================================================
+    eval_items = [(f"{i + 1}. [{specs[k]['label']}]", specs[k]['short'], test_probs[k],
+                   F.softmax(test_logits[k], dim=1), f"{specs[k]['label']} Confusion Matrix",
+                   specs[k]['cm'], specs[k]['cmap']) for i, k in enumerate(keys)]
+    eval_items.append((f"{len(keys) + 1}. [Proposed Calibrated Ensemble]", 'Calib-Ensemble', probs_ensemble, None,
+                       "Calibrated Ensemble Confusion Matrix", 'cm_ensemble.png', 'Purples'))
 
-    for header, preds, cm_title, cm_file, cmap in eval_configs:
+    summary = {}
+    for header, short, probs, raw_probs, cm_title, cm_file, cmap in eval_items:
+        preds = probs.argmax(dim=1).numpy()
+        acc = accuracy_score(test_labels, preds) * 100
+        mf1 = f1_score(test_labels, preds, average='macro') * 100
+        ece = expected_calibration_error(probs, test_labels) * 100
+        ece_raw = expected_calibration_error(raw_probs, test_labels) * 100 if raw_probs is not None else None
+        summary[short] = {'test_acc': acc, 'test_macro_f1': mf1, 'ece': ece, 'ece_before_ts': ece_raw}
+
         print("\n" + "=" * 60)
-        print(f"{header} Test Accuracy: {accuracy_score(labels, preds) * 100:.2f}%")
-        print(classification_report(labels, preds, target_names=class_names, digits=4))
-        save_confusion_matrix(labels, preds, class_names, cm_title, os.path.join(out_dir, cm_file), cmap)
+        ece_str = f"ECE: {ece:.2f}%" + (f" (TS 前 {ece_raw:.2f}%)" if ece_raw is not None else '')
+        print(f"{header} Test Accuracy: {acc:.2f}% | Macro-F1: {mf1:.2f}% | {ece_str}")
+        print(classification_report(test_labels, preds, target_names=class_names, digits=4))
+        save_confusion_matrix(test_labels, preds, class_names, cm_title, os.path.join(out_dir, cm_file), cmap)
 
     # ==========================================================
-    # 5. [Course Merit: Deployment] 导出移动端轻量化推理模型 (.pt / .onnx)
+    # 6. 效率对比: Params / GFLOPs / 延迟, 与精度画在同一张图中
     # ==========================================================
-    print("\n" + "=" * 60)
-    print("Exporting Model for Mobile Deployment (Android / iOS / Web)...")
-    deploy_wrapper = MobileDeployWrapper(model_modern.cpu(), cardboard_bias=1.06, plastic_bias=1.06).eval()
-    dummy_input = torch.randn(1, 3, 224, 224)
+    if not args.skip_benchmark:
+        rows = []
+        bench_device = torch.device('cpu')  # 以 CPU 单图延迟近似移动端场景
+        for k in keys:
+            b = benchmark_model(loaded[k], args.img_size, bench_device)
+            rows.append({'name': specs[k]['short'], **b, **summary[specs[k]['short']]})
+            loaded[k].to(device)
+        rows.append({'name': 'Calib-Ensemble', 'device': 'cpu',
+                     'params_m': sum(r['params_m'] for r in rows), 'gflops': sum(r['gflops'] for r in rows),
+                     'latency_ms': sum(r['latency_ms'] for r in rows), **summary['Calib-Ensemble']})
 
-    # 导出 TorchScript (供移动端 PyTorch Mobile / CoreML 转换使用)
-    traced_script = torch.jit.trace(deploy_wrapper, dummy_input)
-    traced_path = os.path.join(out_dir, 'mobile_trash_classifier.pt')
-    traced_script.save(traced_path)
-    print(f"  --> Saved TorchScript Mobile Model: {traced_path}")
+        print("\n" + "=" * 92)
+        print(f"{'Model':<16} | {'Params(M)':>9} | {'GFLOPs':>7} | {'CPU Lat(ms)':>11} | "
+              f"{'Acc(%)':>7} | {'MacroF1(%)':>10} | {'ECE(%)':>6}")
+        print("-" * 92)
+        for r in rows:
+            print(f"{r['name']:<16} | {r['params_m']:>9.2f} | {r['gflops']:>7.2f} | {r['latency_ms']:>11.1f} | "
+                  f"{r['test_acc']:>7.2f} | {r['test_macro_f1']:>10.2f} | {r['ece']:>6.2f}")
+        print("=" * 92)
+
+        with open(os.path.join(out_dir, 'results_summary.csv'), 'w', newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+            writer.writeheader()
+            writer.writerows(rows)
+        plot_efficiency(rows, os.path.join(out_dir, 'accuracy_vs_compute.png'))
+
+    # ==========================================================
+    # 7. 导出移动端 ONNX (校准参数全部来自验证集)
+    # ==========================================================
+    if not args.skip_export:
+        mobile_ensemble = MobileDeployWrapper(
+            [loaded[k].cpu() for k in keys], temperatures=ens_cfg['temperatures'], weights=ens_cfg['weights'],
+            alpha=ens_cfg['alpha'], class_bias=ens_cfg['class_bias'], num_classes=num_classes).eval()
+        dummy_input = torch.randn(1, 3, args.img_size, args.img_size)
+        onnx_save_path = os.path.join(out_dir, 'mobile_ensemble_trash.onnx')
+        with torch.no_grad():
+            torch.onnx.export(
+                mobile_ensemble,
+                dummy_input,
+                onnx_save_path,
+                export_params=True,
+                opset_version=14,  # 移动端兼容性与算子支持极佳的版本
+                do_constant_folding=True,  # 开启常量折叠优化
+                input_names=['input'],
+                output_names=['output'],
+                dynamic_axes=None  # 固定单图推理尺寸，提升移动端执行效率
+            )
+        print(f"移动端 ONNX 模型已成功导出: {onnx_save_path}")
