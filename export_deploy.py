@@ -110,45 +110,11 @@ def main():
     )
     fp32_size_mb = os.path.getsize(fp32_onnx_path) / (1024 * 1024)
     print(f"  --> 导出成功! 体积: {fp32_size_mb:.2f} MB")
-    
-    # 4. 执行 INT8 动态量化 (体积骤降，非常适合移动端 CPU 推理)
-    int8_onnx_path = os.path.join(out_dir, 'modern_hybrid_trash_int8.onnx')
-    print(f"\n[2/3] 正在执行 INT8 动态量化 -> {os.path.basename(int8_onnx_path)} ...")
-    try:
-        from onnxruntime.quantization import quantize_dynamic, QuantType
-        quantize_dynamic(
-            model_input=fp32_onnx_path,
-            model_output=int8_onnx_path,
-            weight_type=QuantType.QInt8,
-            per_channel=True
-        )
-        int8_size_mb = os.path.getsize(int8_onnx_path) / (1024 * 1024)
-        print(f"  --> 量化成功! 体积: {int8_size_mb:.2f} MB (压缩率: {(1 - int8_size_mb/fp32_size_mb)*100:.1f}%)")
-    except Exception as e:
-        print(f"量化失败: {e}")
-        int8_onnx_path = None
+
         
     # 5. 实测测试集表现与延迟对比
     print(f"\n[3/3] 正在实测独立测试集准确率与 CPU 单帧推理速度...")
     acc_fp32, f1_fp32, lat_fp32 = evaluate_onnx(fp32_onnx_path, test_loader)
     print(f"  * FP32  模型 | 准确率: {acc_fp32:.2f}% | Macro-F1: {f1_fp32:.2f}% | CPU延迟: {lat_fp32:.1f} ms/张")
-    
-    if int8_onnx_path and os.path.exists(int8_onnx_path):
-        acc_int8, f1_int8, lat_int8 = evaluate_onnx(int8_onnx_path, test_loader)
-        print(f"  * INT8  量化 | 准确率: {acc_int8:.2f}% | Macro-F1: {f1_int8:.2f}% | CPU延迟: {lat_int8:.1f} ms/张")
-    
-    old_ensemble_path = os.path.join(out_dir, 'mobile_ensemble_trash.onnx')
-    old_size = os.path.getsize(old_ensemble_path) / (1024 * 1024) if os.path.exists(old_ensemble_path) else 436.0
-    
-    print("\n" + "=" * 70)
-    print("【最终方案对比总结】")
-    print(f"1. 原多模型集成 (mobile_ensemble_trash.onnx):")
-    print(f"   - 体积: {old_size:.1f} MB | 准确率: 96.58% | 延迟: ~346 ms (臃肿冗余)")
-    print(f"2. 推荐量化模型 (modern_hybrid_trash_int8.onnx):")
-    print(f"   - 体积: {int8_size_mb:.1f} MB (立省 {(old_size - int8_size_mb):.1f} MB, 缩小 {(1 - int8_size_mb/old_size)*100:.1f}%)")
-    print(f"   - 准确率: {acc_int8:.2f}% (比原集成还要高 +{(acc_int8 - 96.58):.2f}%)")
-    print(f"   - 延迟: {lat_int8:.1f} ms (提速 {(346.0 / lat_int8):.1f} 倍)")
-    print("=" * 70)
-
 if __name__ == '__main__':
     main()

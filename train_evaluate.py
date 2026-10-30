@@ -197,26 +197,3 @@ if __name__ == '__main__':
             writer.writeheader()
             writer.writerows(rows)
         plot_efficiency(rows, os.path.join(out_dir, 'accuracy_vs_compute.png'))
-
-    # ==========================================================
-    # 7. 导出移动端 ONNX (校准参数全部来自验证集)
-    # ==========================================================
-    if not args.skip_export:
-        mobile_ensemble = MobileDeployWrapper(
-            [loaded[k].cpu() for k in keys], temperatures=ens_cfg['temperatures'], weights=ens_cfg['weights'],
-            alpha=ens_cfg['alpha'], class_bias=ens_cfg['class_bias'], num_classes=num_classes).eval()
-        dummy_input = torch.randn(1, 3, args.img_size, args.img_size)
-        onnx_save_path = os.path.join(out_dir, 'mobile_ensemble_trash.onnx')
-        with torch.no_grad():
-            torch.onnx.export(
-                mobile_ensemble,
-                dummy_input,
-                onnx_save_path,
-                export_params=True,
-                opset_version=14,  # 移动端兼容性与算子支持极佳的版本
-                do_constant_folding=True,  # 开启常量折叠优化
-                input_names=['input'],
-                output_names=['output'],
-                dynamic_axes=None  # 固定单图推理尺寸，提升移动端执行效率
-            )
-        print(f"移动端 ONNX 模型已成功导出: {onnx_save_path}")
